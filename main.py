@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 from pathlib import Path
+import shlex
 import sys
 
 try:
@@ -56,12 +57,33 @@ class KWinWindowEvents(ServiceInterface):
             print(f"invalid pid payload: {payload!r}", file=sys.stderr, flush=True)
             return False
 
+        argv = read_argv(pid)
+
         if self._json_output:
-            print(json.dumps({"pid": pid}, separators=(",", ":")), flush=True)
+            print(json.dumps({"pid": pid, "argv": argv}, separators=(",", ":")), flush=True)
         else:
-            print(pid, flush=True)
+            print(f"{pid}\t{shlex.join(argv)}", flush=True)
 
         return True
+
+
+def read_argv(pid: int) -> list[str]:
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError as exc:
+        print(f"failed to read /proc/{pid}/cmdline: {exc}", file=sys.stderr, flush=True)
+        return []
+
+    if not cmdline:
+        return []
+
+    if cmdline.endswith(b"\0"):
+        cmdline = cmdline[:-1]
+
+    return [
+        arg.decode("utf-8", errors="replace")
+        for arg in cmdline.split(b"\0")
+    ]
 
 
 async def get_dbus_interface(bus: MessageBus, service: str, path: str, interface: str):
