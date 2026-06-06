@@ -12,6 +12,8 @@ from pypresence import AioPresence
 DEFAULT_DETECTABLE_PATH = Path(__file__).resolve().with_name("detectable.json")
 DISCORD_CONNECTION_TIMEOUT = 5
 DISCORD_RESPONSE_TIMEOUT = 5
+PROCESS_EXIT_POLL_INTERVAL_SECONDS = 5
+PROCESS_EXIT_POLL_ATTEMPTS = 12
 
 
 class DetectableDataError(RuntimeError):
@@ -36,10 +38,22 @@ class DiscordPresenceManager:
         self._pid: Optional[int] = None
         self._lock = asyncio.Lock()
         self._tasks: set[asyncio.Task[None]] = set()
+        self._process_exit_watch_tasks: dict[int, asyncio.Task[None]] = {}
 
     def set_detected_process(self, process: DetectableProcess, *, pid: int) -> None:
+        self._cancel_process_exit_watch(pid)
         task = asyncio.create_task(self._set_application(process, pid=pid))
         self._tasks.add(task)
+        task.add_done_callback(self._handle_task_done)
+
+    def watch_process_exit_after_windows_closed(self, *, pid: int) -> None:
+        if pid in self._process_exit_watch_tasks:
+            return
+
+        task = asyncio.create_task(self._watch_process_exit_after_windows_closed(pid))
+        self._process_exit_watch_tasks[pid] = task
+        self._tasks.add(task)
+        task.add_done_callback(lambda task, pid=pid: self._handle_process_exit_watch_done(pid, task))
         task.add_done_callback(self._handle_task_done)
 
     def _handle_task_done(self, task: asyncio.Task[None]) -> None:
@@ -50,6 +64,21 @@ class DiscordPresenceManager:
             pass
         except Exception as exc:
             print(f"failed to update Discord presence: {exc}", file=sys.stderr, flush=True)
+
+    def _handle_process_exit_watch_done(self, pid: int, task: asyncio.Task[None]) -> None:
+        if self._process_exit_watch_tasks.get(pid) is task:
+            del self._process_exit_watch_tasks[pid]
+
+    def _cancel_process_exit_watch(self, pid: int) -> None:
+        task = self._process_exit_watch_tasks.pop(pid, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _cancel_process_exit_watches(self, *, except_pid: Optional[int] = None) -> None:
+        for pid in list(self._process_exit_watch_tasks):
+            if pid == except_pid:
+                continue
+            self._cancel_process_exit_watch(pid)
 
     async def _set_application(self, process: DetectableProcess, *, pid: int) -> None:
         async with self._lock:
@@ -63,6 +92,7 @@ class DiscordPresenceManager:
                             f"{process.application_id} ({process.application_name or process.executable_name}): {exc}"
                         ) from exc
                     self._pid = pid
+                self._cancel_process_exit_watches(except_pid=pid)
                 return
 
             await self._close_rpc()
@@ -85,8 +115,22 @@ class DiscordPresenceManager:
             self._rpc = rpc
             self._application_id = process.application_id
             self._pid = pid
+            self._cancel_process_exit_watches(except_pid=pid)
+
+    async def _watch_process_exit_after_windows_closed(self, pid: int) -> None:
+        for _ in range(PROCESS_EXIT_POLL_ATTEMPTS):
+            await asyncio.sleep(PROCESS_EXIT_POLL_INTERVAL_SECONDS)
+            if not process_has_exited(pid):
+                continue
+
+            async with self._lock:
+                if self._pid == pid:
+                    await self._close_rpc()
+            return
 
     async def close(self) -> None:
+        self._cancel_process_exit_watches()
+
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
 
@@ -171,6 +215,10 @@ class DiscordWindowActivityHandler:
 
         return True
 
+    def windows_closed(self, pid: int) -> bool:
+        self._presence_manager.watch_process_exit_after_windows_closed(pid=pid)
+        return True
+
 
 def read_argv(pid: int) -> list[str]:
     try:
@@ -196,6 +244,34 @@ def read_exe_path(pid: int) -> Optional[Path]:
         return Path(f"/proc/{pid}/exe").readlink()
     except OSError:
         return None
+
+
+def process_has_exited(pid: int) -> bool:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        print(f"failed to check /proc/{pid}/stat: {exc}", file=sys.stderr, flush=True)
+        return False
+
+    state = process_stat_state(stat)
+    if state is None:
+        return False
+
+    return state in {"X", "Z"}
+
+
+def process_stat_state(stat: str) -> Optional[str]:
+    _, separator, rest = stat.rpartition(")")
+    if not separator:
+        return None
+
+    fields = rest.strip().split()
+    if not fields:
+        return None
+
+    return fields[0]
 
 
 def is_wine_exe_path(exe_path: Optional[Path]) -> bool:

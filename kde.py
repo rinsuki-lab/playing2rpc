@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 import sys
-from typing import Callable
+from typing import Callable, Optional
 
 from dbus_next import Message, MessageType
 from dbus_next.aio import MessageBus
@@ -21,6 +21,7 @@ KWIN_SCRIPT_NAME = "net.rinsuki.lab.Playing2RPC.KWinWindowEvents"
 DEFAULT_KWIN_SCRIPT_PATH = Path(__file__).resolve().with_name("kwin.js")
 
 WindowAddedCallback = Callable[[int], bool]
+WindowClosedCallback = Callable[[int], bool]
 
 
 class KWinScriptError(RuntimeError):
@@ -28,24 +29,45 @@ class KWinScriptError(RuntimeError):
 
 
 class KWinWindowEvents(ServiceInterface):
-    def __init__(self, on_window_added: WindowAddedCallback) -> None:
+    def __init__(
+        self,
+        *,
+        on_window_added: WindowAddedCallback,
+        on_window_closed: WindowClosedCallback,
+    ) -> None:
         super().__init__(DBUS_INTERFACE)
         self._on_window_added = on_window_added
+        self._on_window_closed = on_window_closed
 
-    @method()
-    def WindowAdded(self, payload: "s") -> "b":
+    def _parse_pid_payload(self, payload: str) -> Optional[int]:
         try:
             data = json.loads(payload)
         except json.JSONDecodeError as exc:
             print(f"invalid JSON payload: {payload!r}: {exc}", file=sys.stderr, flush=True)
-            return False
+            return None
 
         pid = data.get("pid")
         if not isinstance(pid, int) or pid <= 0:
             print(f"invalid pid payload: {payload!r}", file=sys.stderr, flush=True)
+            return None
+
+        return pid
+
+    @method()
+    def WindowAdded(self, payload: "s") -> "b":
+        pid = self._parse_pid_payload(payload)
+        if pid is None:
             return False
 
         return self._on_window_added(pid)
+
+    @method()
+    def WindowClosed(self, payload: "s") -> "b":
+        pid = self._parse_pid_payload(payload)
+        if pid is None:
+            return False
+
+        return self._on_window_closed(pid)
 
 
 async def get_dbus_interface(bus: MessageBus, service: str, path: str, interface: str):

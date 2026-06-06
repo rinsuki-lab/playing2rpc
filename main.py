@@ -54,7 +54,10 @@ async def run(
 
         bus.export(
             DBUS_PATH,
-            KWinWindowEvents(on_window_added=activity_handler.window_added),
+            KWinWindowEvents(
+                on_window_added=activity_handler.window_added,
+                on_window_closed=activity_handler.windows_closed,
+            ),
         )
 
         if load_script:
