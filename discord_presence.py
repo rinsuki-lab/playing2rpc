@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import shlex
 import sys
-from typing import Optional
+from typing import Optional, Protocol
 
 from pypresence import AioPresence
 
@@ -31,14 +31,21 @@ class DetectableProcess:
 DetectableIndex = dict[str, dict[str, list[DetectableProcess]]]
 
 
+class NotificationSender(Protocol):
+    async def notify(self, *, summary: str, body: str) -> None:
+        ...
+
+
 class DiscordPresenceManager:
-    def __init__(self) -> None:
+    def __init__(self, *, notifier: Optional[NotificationSender] = None) -> None:
         self._rpc: Optional[AioPresence] = None
         self._application_id: Optional[str] = None
+        self._application_label: Optional[str] = None
         self._pid: Optional[int] = None
         self._lock = asyncio.Lock()
         self._tasks: set[asyncio.Task[None]] = set()
         self._process_exit_watch_tasks: dict[int, asyncio.Task[None]] = {}
+        self._notifier = notifier
 
     def set_detected_process(self, process: DetectableProcess, *, pid: int) -> None:
         self._cancel_process_exit_watch(pid)
@@ -82,6 +89,7 @@ class DiscordPresenceManager:
 
     async def _set_application(self, process: DetectableProcess, *, pid: int) -> None:
         async with self._lock:
+            process_label = process_display_name(process)
             if self._application_id == process.application_id and self._rpc is not None:
                 if self._pid != pid:
                     try:
@@ -92,10 +100,13 @@ class DiscordPresenceManager:
                             f"{process.application_id} ({process.application_name or process.executable_name}): {exc}"
                         ) from exc
                     self._pid = pid
+                self._application_label = process_label
                 self._cancel_process_exit_watches(except_pid=pid)
                 return
 
-            await self._close_rpc()
+            previous_application_label = self._application_label
+            presence_was_active = self._rpc is not None
+            await self._close_rpc(notify_end=False)
 
             rpc = AioPresence(
                 process.application_id,
@@ -108,14 +119,24 @@ class DiscordPresenceManager:
                 await rpc.update(pid=pid, name=process.application_name)
             except Exception as exc:
                 await self._close_rpc_client(rpc, clear_pid=None)
+                if presence_was_active:
+                    await self._notify_presence_ended(previous_application_label)
                 raise RuntimeError(
                     f"{process.application_id} ({process.application_name or process.executable_name}): {exc}"
                 ) from exc
 
             self._rpc = rpc
             self._application_id = process.application_id
+            self._application_label = process_label
             self._pid = pid
             self._cancel_process_exit_watches(except_pid=pid)
+            if presence_was_active:
+                await self._notify_presence_switched(
+                    old_label=previous_application_label,
+                    new_label=process_label,
+                )
+            else:
+                await self._notify_presence_started(process_label)
 
     async def _watch_process_exit_after_windows_closed(self, pid: int) -> None:
         for _ in range(PROCESS_EXIT_POLL_ATTEMPTS):
@@ -137,15 +158,55 @@ class DiscordPresenceManager:
         async with self._lock:
             await self._close_rpc()
 
-    async def _close_rpc(self) -> None:
+    async def _close_rpc(self, *, notify_end: bool = True) -> None:
         rpc = self._rpc
         pid = self._pid
+        application_label = self._application_label
         self._rpc = None
         self._application_id = None
+        self._application_label = None
         self._pid = None
 
         if rpc is not None:
             await self._close_rpc_client(rpc, clear_pid=pid)
+            if notify_end:
+                await self._notify_presence_ended(application_label)
+
+    async def _notify_presence_started(self, application_label: str) -> None:
+        await self._notify(
+            summary="Rich Presence started",
+            body=application_label,
+        )
+
+    async def _notify_presence_switched(
+        self,
+        *,
+        old_label: Optional[str],
+        new_label: str,
+    ) -> None:
+        if old_label is None:
+            await self._notify_presence_started(new_label)
+            return
+
+        await self._notify(
+            summary="Rich Presence switched",
+            body=f"{old_label} -> {new_label}",
+        )
+
+    async def _notify_presence_ended(self, application_label: Optional[str]) -> None:
+        await self._notify(
+            summary="Rich Presence ended",
+            body=application_label or "Unknown application",
+        )
+
+    async def _notify(self, *, summary: str, body: str) -> None:
+        if self._notifier is None:
+            return
+
+        try:
+            await self._notifier.notify(summary=summary, body=body)
+        except Exception as exc:
+            print(f"failed to send desktop notification: {exc}", file=sys.stderr, flush=True)
 
     async def _close_rpc_client(self, rpc: AioPresence, *, clear_pid: Optional[int]) -> None:
         if rpc.sock_writer is None:
@@ -417,6 +478,10 @@ def detectable_process_to_json(process: Optional[DetectableProcess]) -> Optional
         "os": process.os,
         "executable": process.executable_name,
     }
+
+
+def process_display_name(process: DetectableProcess) -> str:
+    return process.application_name or process.executable_name
 
 
 def format_detected_process(process: Optional[DetectableProcess]) -> str:

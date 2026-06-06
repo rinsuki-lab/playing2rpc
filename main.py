@@ -9,6 +9,7 @@ from dbus_next.aio import MessageBus
 from dbus_next.constants import RequestNameReply
 from dbus_next.errors import DBusError, InterfaceNotFoundError
 
+from desktop_notifications import DesktopNotifier
 from discord_presence import (
     DEFAULT_DETECTABLE_PATH,
     DetectableDataError,
@@ -38,13 +39,13 @@ async def run(
     detectable_path: Path,
 ) -> None:
     detectables = load_detectables(detectable_path)
-    presence_manager = DiscordPresenceManager()
+    bus = await MessageBus().connect()
+    presence_manager = DiscordPresenceManager(notifier=DesktopNotifier(bus))
     activity_handler = DiscordWindowActivityHandler(
         json_output=json_output,
         detectables=detectables,
         presence_manager=presence_manager,
     )
-    bus = await MessageBus().connect()
     loaded_kwin_script = False
 
     try:
