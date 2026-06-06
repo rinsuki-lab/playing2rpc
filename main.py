@@ -58,11 +58,12 @@ class KWinWindowEvents(ServiceInterface):
             return False
 
         argv = read_argv(pid)
+        is_wine = is_wine_process(pid)
 
         if self._json_output:
-            print(json.dumps({"pid": pid, "argv": argv}, separators=(",", ":")), flush=True)
+            print(json.dumps({"pid": pid, "argv": argv, "is_wine": is_wine}, separators=(",", ":")), flush=True)
         else:
-            print(f"{pid}\t{shlex.join(argv)}", flush=True)
+            print(f"{pid}\twine={str(is_wine).lower()}\t{shlex.join(argv)}", flush=True)
 
         return True
 
@@ -84,6 +85,15 @@ def read_argv(pid: int) -> list[str]:
         arg.decode("utf-8", errors="replace")
         for arg in cmdline.split(b"\0")
     ]
+
+
+def is_wine_process(pid: int) -> bool:
+    try:
+        exe_path = Path(f"/proc/{pid}/exe").readlink()
+    except OSError:
+        return False
+
+    return exe_path.name.startswith("wine")
 
 
 async def get_dbus_interface(bus: MessageBus, service: str, path: str, interface: str):
