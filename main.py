@@ -24,6 +24,17 @@ except ModuleNotFoundError as exc:
     )
     raise SystemExit(1) from exc
 
+try:
+    from pypresence import AioPresence
+except ModuleNotFoundError as exc:
+    if exc.name != "pypresence":
+        raise
+    print(
+        "main.py requires pypresence. Install it with: python3 -m pip install pypresence",
+        file=sys.stderr,
+    )
+    raise SystemExit(1) from exc
+
 
 DBUS_SERVICE = "net.rinsuki.lab.Playing2RPC"
 DBUS_PATH = "/net/rinsuki/lab/Playing2RPC/KWinWindowEvents"
@@ -36,6 +47,8 @@ KWIN_SCRIPT_INTERFACE = "org.kde.kwin.Script"
 KWIN_SCRIPT_NAME = "net.rinsuki.lab.Playing2RPC.KWinWindowEvents"
 DEFAULT_KWIN_SCRIPT_PATH = Path(__file__).resolve().with_name("kwin.js")
 DEFAULT_DETECTABLE_PATH = Path(__file__).resolve().with_name("detectable.json")
+DISCORD_CONNECTION_TIMEOUT = 5
+DISCORD_RESPONSE_TIMEOUT = 5
 
 
 class KWinScriptError(RuntimeError):
@@ -57,11 +70,115 @@ class DetectableProcess:
 DetectableIndex = dict[str, dict[str, list[DetectableProcess]]]
 
 
+class DiscordPresenceManager:
+    def __init__(self) -> None:
+        self._rpc: Optional[AioPresence] = None
+        self._application_id: Optional[str] = None
+        self._pid: Optional[int] = None
+        self._lock = asyncio.Lock()
+        self._tasks: set[asyncio.Task[None]] = set()
+
+    def set_detected_process(self, process: DetectableProcess, *, pid: int) -> None:
+        task = asyncio.create_task(self._set_application(process, pid=pid))
+        self._tasks.add(task)
+        task.add_done_callback(self._handle_task_done)
+
+    def _handle_task_done(self, task: asyncio.Task[None]) -> None:
+        self._tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            print(f"failed to update Discord presence: {exc}", file=sys.stderr, flush=True)
+
+    async def _set_application(self, process: DetectableProcess, *, pid: int) -> None:
+        async with self._lock:
+            if self._application_id == process.application_id and self._rpc is not None:
+                if self._pid != pid:
+                    try:
+                        await self._rpc.update(pid=pid, name=process.application_name)
+                    except Exception as exc:
+                        await self._close_rpc()
+                        raise RuntimeError(
+                            f"{process.application_id} ({process.application_name or process.executable_name}): {exc}"
+                        ) from exc
+                    self._pid = pid
+                return
+
+            await self._close_rpc()
+
+            rpc = AioPresence(
+                process.application_id,
+                connection_timeout=DISCORD_CONNECTION_TIMEOUT,
+                response_timeout=DISCORD_RESPONSE_TIMEOUT,
+            )
+
+            try:
+                await rpc.connect()
+                await rpc.update(pid=pid, name=process.application_name)
+            except Exception as exc:
+                await self._close_rpc_client(rpc, clear_pid=None)
+                raise RuntimeError(
+                    f"{process.application_id} ({process.application_name or process.executable_name}): {exc}"
+                ) from exc
+
+            self._rpc = rpc
+            self._application_id = process.application_id
+            self._pid = pid
+
+    async def close(self) -> None:
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+
+        async with self._lock:
+            await self._close_rpc()
+
+    async def _close_rpc(self) -> None:
+        rpc = self._rpc
+        pid = self._pid
+        self._rpc = None
+        self._application_id = None
+        self._pid = None
+
+        if rpc is not None:
+            await self._close_rpc_client(rpc, clear_pid=pid)
+
+    async def _close_rpc_client(self, rpc: AioPresence, *, clear_pid: Optional[int]) -> None:
+        if rpc.sock_writer is None:
+            return
+
+        if clear_pid is not None:
+            try:
+                await rpc.clear(pid=clear_pid)
+            except Exception as exc:
+                print(f"failed to clear Discord presence: {exc}", file=sys.stderr, flush=True)
+
+        try:
+            rpc.send_data(2, {"v": 1, "client_id": rpc.client_id})
+        except (AssertionError, OSError, RuntimeError):
+            pass
+
+        writer = rpc.sock_writer
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (OSError, RuntimeError):
+            pass
+
+
 class KWinWindowEvents(ServiceInterface):
-    def __init__(self, *, json_output: bool, detectables: DetectableIndex) -> None:
+    def __init__(
+        self,
+        *,
+        json_output: bool,
+        detectables: DetectableIndex,
+        presence_manager: DiscordPresenceManager,
+    ) -> None:
         super().__init__(DBUS_INTERFACE)
         self._json_output = json_output
         self._detectables = detectables
+        self._presence_manager = presence_manager
 
     @method()
     def WindowAdded(self, payload: "s") -> "b":
@@ -86,6 +203,8 @@ class KWinWindowEvents(ServiceInterface):
             argv=argv,
             exe_path=exe_path,
         )
+        if detected_process is not None:
+            self._presence_manager.set_detected_process(detected_process, pid=pid)
 
         if self._json_output:
             payload = {
@@ -388,6 +507,7 @@ async def run(
     detectable_path: Path,
 ) -> None:
     detectables = load_detectables(detectable_path)
+    presence_manager = DiscordPresenceManager()
     bus = await MessageBus().connect()
     loaded_kwin_script = False
 
@@ -396,7 +516,14 @@ async def run(
         if name_reply not in (RequestNameReply.PRIMARY_OWNER, RequestNameReply.ALREADY_OWNER):
             raise KWinScriptError(f"could not own D-Bus service {DBUS_SERVICE}: {name_reply}")
 
-        bus.export(DBUS_PATH, KWinWindowEvents(json_output=json_output, detectables=detectables))
+        bus.export(
+            DBUS_PATH,
+            KWinWindowEvents(
+                json_output=json_output,
+                detectables=detectables,
+                presence_manager=presence_manager,
+            ),
+        )
 
         if load_script:
             await load_kwin_script(bus, kwin_script_path, kwin_script_name)
@@ -409,6 +536,7 @@ async def run(
                 await unload_kwin_script(bus, kwin_script_name)
             except (DBusError, InterfaceNotFoundError) as exc:
                 print(f"failed to unload KWin script: {exc}", file=sys.stderr)
+        await presence_manager.close()
         bus.disconnect()
         await bus.wait_for_disconnect()
 
