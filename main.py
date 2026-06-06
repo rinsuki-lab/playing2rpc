@@ -2,10 +2,12 @@
 
 import argparse
 import asyncio
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import shlex
 import sys
+from typing import Optional
 
 try:
     from dbus_next import Message, MessageType
@@ -33,16 +35,33 @@ KWIN_SCRIPTING_INTERFACE = "org.kde.kwin.Scripting"
 KWIN_SCRIPT_INTERFACE = "org.kde.kwin.Script"
 KWIN_SCRIPT_NAME = "net.rinsuki.lab.Playing2RPC.KWinWindowEvents"
 DEFAULT_KWIN_SCRIPT_PATH = Path(__file__).resolve().with_name("kwin.js")
+DEFAULT_DETECTABLE_PATH = Path(__file__).resolve().with_name("detectable.json")
 
 
 class KWinScriptError(RuntimeError):
     pass
 
 
+class DetectableDataError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class DetectableProcess:
+    application_id: str
+    application_name: Optional[str]
+    os: str
+    executable_name: str
+
+
+DetectableIndex = dict[str, dict[str, list[DetectableProcess]]]
+
+
 class KWinWindowEvents(ServiceInterface):
-    def __init__(self, *, json_output: bool) -> None:
+    def __init__(self, *, json_output: bool, detectables: DetectableIndex) -> None:
         super().__init__(DBUS_INTERFACE)
         self._json_output = json_output
+        self._detectables = detectables
 
     @method()
     def WindowAdded(self, payload: "s") -> "b":
@@ -58,12 +77,32 @@ class KWinWindowEvents(ServiceInterface):
             return False
 
         argv = read_argv(pid)
-        is_wine = is_wine_process(pid)
+        exe_path = read_exe_path(pid)
+        is_wine = is_wine_exe_path(exe_path)
+        detectable_os = "win32" if is_wine else "linux"
+        detected_process = detect_process(
+            self._detectables,
+            os_name=detectable_os,
+            argv=argv,
+            exe_path=exe_path,
+        )
 
         if self._json_output:
-            print(json.dumps({"pid": pid, "argv": argv, "is_wine": is_wine}, separators=(",", ":")), flush=True)
+            payload = {
+                "pid": pid,
+                "argv": argv,
+                "is_wine": is_wine,
+                "detectable_os": detectable_os,
+                "detected_process": detectable_process_to_json(detected_process),
+            }
+            print(json.dumps(payload, separators=(",", ":")), flush=True)
         else:
-            print(f"{pid}\twine={str(is_wine).lower()}\t{shlex.join(argv)}", flush=True)
+            detected_process_text = format_detected_process(detected_process)
+            print(
+                f"{pid}\twine={str(is_wine).lower()}\tos={detectable_os}"
+                f"\tdetected={detected_process_text}\t{shlex.join(argv)}",
+                flush=True,
+            )
 
         return True
 
@@ -87,13 +126,166 @@ def read_argv(pid: int) -> list[str]:
     ]
 
 
-def is_wine_process(pid: int) -> bool:
+def read_exe_path(pid: int) -> Optional[Path]:
     try:
-        exe_path = Path(f"/proc/{pid}/exe").readlink()
+        return Path(f"/proc/{pid}/exe").readlink()
     except OSError:
+        return None
+
+
+def is_wine_exe_path(exe_path: Optional[Path]) -> bool:
+    if exe_path is None:
         return False
 
     return exe_path.name.startswith("wine")
+
+
+def is_wine_process(pid: int) -> bool:
+    return is_wine_exe_path(read_exe_path(pid))
+
+
+def load_detectables(path: Path) -> DetectableIndex:
+    try:
+        data = json.loads(path.read_text())
+    except OSError as exc:
+        raise DetectableDataError(f"failed to read detectable data {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise DetectableDataError(f"failed to parse detectable data {path}: {exc}") from exc
+
+    if not isinstance(data, list):
+        raise DetectableDataError(f"detectable data must be a list: {path}")
+
+    index: DetectableIndex = {}
+    for application in data:
+        if not isinstance(application, dict):
+            continue
+
+        application_id = application.get("id")
+        if not isinstance(application_id, str):
+            continue
+
+        application_name_value = application.get("name")
+        application_name = application_name_value if isinstance(application_name_value, str) else None
+
+        executables = application.get("executables")
+        if not isinstance(executables, list):
+            continue
+
+        for executable in executables:
+            if not isinstance(executable, dict):
+                continue
+
+            os_name = executable.get("os")
+            executable_name = executable.get("name")
+            if not isinstance(os_name, str) or not isinstance(executable_name, str):
+                continue
+
+            normalized_name = normalize_executable_name(executable_name)
+            if not normalized_name:
+                continue
+
+            process = DetectableProcess(
+                application_id=application_id,
+                application_name=application_name,
+                os=os_name,
+                executable_name=executable_name,
+            )
+            index.setdefault(os_name, {}).setdefault(normalized_name, []).append(process)
+
+    return index
+
+
+def normalize_executable_name(name: str) -> str:
+    return name.strip().replace("\\", "/").casefold()
+
+
+def process_executable_candidates(
+    *,
+    os_name: str,
+    argv: list[str],
+    exe_path: Optional[Path],
+) -> list[str]:
+    candidates: list[str] = []
+
+    def add(candidate: str) -> None:
+        normalized = normalize_executable_name(candidate)
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+
+    if exe_path is not None:
+        add(str(exe_path))
+        add(exe_path.name)
+
+    if not argv:
+        return candidates
+
+    if os_name == "win32":
+        for arg in argv:
+            normalized = normalize_executable_name(arg)
+            if normalized.endswith(".exe") or "/" in normalized:
+                add(arg)
+    else:
+        add(argv[0])
+
+    return candidates
+
+
+def executable_name_suffixes(candidate: str) -> list[str]:
+    parts = [part for part in candidate.split("/") if part]
+    return ["/".join(parts[index:]) for index in range(len(parts))]
+
+
+def unique_process_match(matches: Optional[list[DetectableProcess]]) -> Optional[DetectableProcess]:
+    if not matches:
+        return None
+
+    application_ids = {match.application_id for match in matches}
+    if len(application_ids) != 1:
+        return None
+
+    return matches[0]
+
+
+def detect_process(
+    detectables: DetectableIndex,
+    *,
+    os_name: str,
+    argv: list[str],
+    exe_path: Optional[Path],
+) -> Optional[DetectableProcess]:
+    os_detectables = detectables.get(os_name, {})
+    if not os_detectables:
+        return None
+
+    for candidate in process_executable_candidates(os_name=os_name, argv=argv, exe_path=exe_path):
+        for suffix in executable_name_suffixes(candidate):
+            match = unique_process_match(os_detectables.get(suffix))
+            if match is not None:
+                return match
+
+    return None
+
+
+def detectable_process_to_json(process: Optional[DetectableProcess]) -> Optional[dict[str, object]]:
+    if process is None:
+        return None
+
+    return {
+        "id": process.application_id,
+        "name": process.application_name,
+        "os": process.os,
+        "executable": process.executable_name,
+    }
+
+
+def format_detected_process(process: Optional[DetectableProcess]) -> str:
+    if process is None:
+        return "-"
+
+    if process.application_name is None:
+        return f"{process.application_id}/{process.executable_name}"
+
+    return f"{process.application_id}/{process.application_name}/{process.executable_name}"
 
 
 async def get_dbus_interface(bus: MessageBus, service: str, path: str, interface: str):
@@ -193,7 +385,9 @@ async def run(
     keep_script: bool,
     kwin_script_path: Path,
     kwin_script_name: str,
+    detectable_path: Path,
 ) -> None:
+    detectables = load_detectables(detectable_path)
     bus = await MessageBus().connect()
     loaded_kwin_script = False
 
@@ -202,7 +396,7 @@ async def run(
         if name_reply not in (RequestNameReply.PRIMARY_OWNER, RequestNameReply.ALREADY_OWNER):
             raise KWinScriptError(f"could not own D-Bus service {DBUS_SERVICE}: {name_reply}")
 
-        bus.export(DBUS_PATH, KWinWindowEvents(json_output=json_output))
+        bus.export(DBUS_PATH, KWinWindowEvents(json_output=json_output, detectables=detectables))
 
         if load_script:
             await load_kwin_script(bus, kwin_script_path, kwin_script_name)
@@ -240,6 +434,12 @@ def parse_args() -> argparse.Namespace:
         help=f"KWin script name used for load/unload (default: {KWIN_SCRIPT_NAME})",
     )
     parser.add_argument(
+        "--detectable",
+        type=Path,
+        default=DEFAULT_DETECTABLE_PATH,
+        help=f"Discord detectable application data path (default: {DEFAULT_DETECTABLE_PATH})",
+    )
+    parser.add_argument(
         "--no-load-kwin-script",
         action="store_true",
         help="do not load kwin.js into KWin; only listen for incoming D-Bus calls",
@@ -262,11 +462,12 @@ def main() -> None:
                 keep_script=args.keep_kwin_script,
                 kwin_script_path=args.kwin_script,
                 kwin_script_name=args.kwin_script_name,
+                detectable_path=args.detectable,
             )
         )
     except KeyboardInterrupt:
         pass
-    except (DBusError, InterfaceNotFoundError, KWinScriptError) as exc:
+    except (DBusError, InterfaceNotFoundError, KWinScriptError, DetectableDataError) as exc:
         print(f"main.py failed: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
 
