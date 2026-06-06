@@ -9,31 +9,12 @@ import shlex
 import sys
 from typing import Optional
 
-try:
-    from dbus_next import Message, MessageType
-    from dbus_next.aio import MessageBus
-    from dbus_next.constants import RequestNameReply
-    from dbus_next.errors import DBusError, InterfaceNotFoundError
-    from dbus_next.service import ServiceInterface, method
-except ModuleNotFoundError as exc:
-    if exc.name != "dbus_next":
-        raise
-    print(
-        "main.py requires dbus-next. Install it with: python3 -m pip install dbus-next",
-        file=sys.stderr,
-    )
-    raise SystemExit(1) from exc
-
-try:
-    from pypresence import AioPresence
-except ModuleNotFoundError as exc:
-    if exc.name != "pypresence":
-        raise
-    print(
-        "main.py requires pypresence. Install it with: python3 -m pip install pypresence",
-        file=sys.stderr,
-    )
-    raise SystemExit(1) from exc
+from dbus_next import Message, MessageType
+from dbus_next.aio import MessageBus
+from dbus_next.constants import RequestNameReply
+from dbus_next.errors import DBusError, InterfaceNotFoundError
+from dbus_next.service import ServiceInterface, method
+from pypresence import AioPresence
 
 
 DBUS_SERVICE = "net.rinsuki.lab.Playing2RPC"
