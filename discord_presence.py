@@ -24,11 +24,16 @@ class DetectableDataError(RuntimeError):
 class DetectableProcess:
     application_id: str
     application_name: Optional[str]
-    os: str
-    executable_name: str
+    os: Optional[str]
+    executable_name: Optional[str]
+    match_type: str
+    steam_app_id: Optional[str] = None
 
 
-DetectableIndex = dict[str, dict[str, list[DetectableProcess]]]
+@dataclass(frozen=True)
+class DetectableIndex:
+    executables: dict[str, dict[str, list[DetectableProcess]]]
+    steam_app_ids: dict[str, list[DetectableProcess]]
 
 
 class NotificationSender(Protocol):
@@ -97,7 +102,7 @@ class DiscordPresenceManager:
                     except Exception as exc:
                         await self._close_rpc()
                         raise RuntimeError(
-                            f"{process.application_id} ({process.application_name or process.executable_name}): {exc}"
+                            f"{process.application_id} ({process_display_name(process)}): {exc}"
                         ) from exc
                     self._pid = pid
                 self._application_label = process_label
@@ -122,7 +127,7 @@ class DiscordPresenceManager:
                 if presence_was_active:
                     await self._notify_presence_ended(previous_application_label)
                 raise RuntimeError(
-                    f"{process.application_id} ({process.application_name or process.executable_name}): {exc}"
+                    f"{process.application_id} ({process_display_name(process)}): {exc}"
                 ) from exc
 
             self._rpc = rpc
@@ -245,6 +250,7 @@ class DiscordWindowActivityHandler:
 
     def window_added(self, pid: int) -> bool:
         argv = read_argv(pid)
+        environ = read_environ(pid)
         exe_path = read_exe_path(pid)
         is_wine = is_wine_exe_path(exe_path)
         detectable_os = "win32" if is_wine else "linux"
@@ -253,6 +259,7 @@ class DiscordWindowActivityHandler:
             os_name=detectable_os,
             argv=argv,
             exe_path=exe_path,
+            environ=environ,
         )
         if detected_process is not None:
             self._presence_manager.set_detected_process(detected_process, pid=pid)
@@ -298,6 +305,32 @@ def read_argv(pid: int) -> list[str]:
         arg.decode("utf-8", errors="replace")
         for arg in cmdline.split(b"\0")
     ]
+
+
+def read_environ(pid: int) -> dict[str, str]:
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError as exc:
+        print(f"failed to read /proc/{pid}/environ: {exc}", file=sys.stderr, flush=True)
+        return {}
+
+    if not environ:
+        return {}
+
+    if environ.endswith(b"\0"):
+        environ = environ[:-1]
+
+    result: dict[str, str] = {}
+    for item in environ.split(b"\0"):
+        key, separator, value = item.partition(b"=")
+        if not separator:
+            continue
+
+        key_text = key.decode("utf-8", errors="replace")
+        value_text = value.decode("utf-8", errors="replace")
+        result[key_text] = value_text
+
+    return result
 
 
 def read_exe_path(pid: int) -> Optional[Path]:
@@ -357,7 +390,8 @@ def load_detectables(path: Path) -> DetectableIndex:
     if not isinstance(data, list):
         raise DetectableDataError(f"detectable data must be a list: {path}")
 
-    index: DetectableIndex = {}
+    executable_index: dict[str, dict[str, list[DetectableProcess]]] = {}
+    steam_app_id_index: dict[str, list[DetectableProcess]] = {}
     for application in data:
         if not isinstance(application, dict):
             continue
@@ -370,31 +404,55 @@ def load_detectables(path: Path) -> DetectableIndex:
         application_name = application_name_value if isinstance(application_name_value, str) else None
 
         executables = application.get("executables")
-        if not isinstance(executables, list):
-            continue
+        if isinstance(executables, list):
+            for executable in executables:
+                if not isinstance(executable, dict):
+                    continue
 
-        for executable in executables:
-            if not isinstance(executable, dict):
-                continue
+                os_name = executable.get("os")
+                executable_name = executable.get("name")
+                if not isinstance(os_name, str) or not isinstance(executable_name, str):
+                    continue
 
-            os_name = executable.get("os")
-            executable_name = executable.get("name")
-            if not isinstance(os_name, str) or not isinstance(executable_name, str):
-                continue
+                normalized_name = normalize_executable_name(executable_name)
+                if not normalized_name:
+                    continue
 
-            normalized_name = normalize_executable_name(executable_name)
-            if not normalized_name:
-                continue
+                process = DetectableProcess(
+                    application_id=application_id,
+                    application_name=application_name,
+                    os=os_name,
+                    executable_name=executable_name,
+                    match_type="executable",
+                )
+                os_index = executable_index.setdefault(os_name, {})
+                os_index.setdefault(normalized_name, []).append(process)
 
-            process = DetectableProcess(
-                application_id=application_id,
-                application_name=application_name,
-                os=os_name,
-                executable_name=executable_name,
-            )
-            index.setdefault(os_name, {}).setdefault(normalized_name, []).append(process)
+        third_party_skus = application.get("third_party_skus")
+        if isinstance(third_party_skus, list):
+            for sku in third_party_skus:
+                if not isinstance(sku, dict):
+                    continue
 
-    return index
+                distributor = sku.get("distributor")
+                sku_id = sku.get("id")
+                if distributor != "steam" or not isinstance(sku_id, str):
+                    continue
+
+                process = DetectableProcess(
+                    application_id=application_id,
+                    application_name=application_name,
+                    os=None,
+                    executable_name=None,
+                    match_type="steam_app_id",
+                    steam_app_id=sku_id,
+                )
+                steam_app_id_index.setdefault(sku_id, []).append(process)
+
+    return DetectableIndex(
+        executables=executable_index,
+        steam_app_ids=steam_app_id_index,
+    )
 
 
 def normalize_executable_name(name: str) -> str:
@@ -448,47 +506,154 @@ def unique_process_match(matches: Optional[list[DetectableProcess]]) -> Optional
     return matches[0]
 
 
-def detect_process(
-    detectables: DetectableIndex,
+def steam_app_id_process(
+    steam_match: DetectableProcess,
+    *,
+    steam_app_id: str,
+    executable_match: Optional[DetectableProcess] = None,
+) -> DetectableProcess:
+    return DetectableProcess(
+        application_id=steam_match.application_id,
+        application_name=steam_match.application_name,
+        os=executable_match.os if executable_match is not None else None,
+        executable_name=executable_match.executable_name if executable_match is not None else None,
+        match_type="steam_app_id",
+        steam_app_id=steam_app_id,
+    )
+
+
+def first_process_with_application_id(
+    matches: list[DetectableProcess],
+    *,
+    application_id: str,
+) -> Optional[DetectableProcess]:
+    for match in matches:
+        if match.application_id == application_id:
+            return match
+
+    return None
+
+
+def detect_executable_process(
+    os_detectables: dict[str, list[DetectableProcess]],
     *,
     os_name: str,
     argv: list[str],
     exe_path: Optional[Path],
+    application_ids: Optional[set[str]] = None,
 ) -> Optional[DetectableProcess]:
-    os_detectables = detectables.get(os_name, {})
     if not os_detectables:
         return None
 
-    for candidate in process_executable_candidates(os_name=os_name, argv=argv, exe_path=exe_path):
+    candidates = process_executable_candidates(os_name=os_name, argv=argv, exe_path=exe_path)
+    for candidate in candidates:
         for suffix in executable_name_suffixes(candidate):
-            match = unique_process_match(os_detectables.get(suffix))
+            matches = os_detectables.get(suffix)
+            if application_ids is not None and matches is not None:
+                matches = [
+                    match
+                    for match in matches
+                    if match.application_id in application_ids
+                ]
+
+            match = unique_process_match(matches)
             if match is not None:
                 return match
 
     return None
 
 
+def detect_process(
+    detectables: DetectableIndex,
+    *,
+    os_name: str,
+    argv: list[str],
+    exe_path: Optional[Path],
+    environ: dict[str, str],
+) -> Optional[DetectableProcess]:
+    os_detectables = detectables.executables.get(os_name, {})
+    steam_app_id = environ.get("SteamAppId")
+    if steam_app_id is not None:
+        steam_matches = detectables.steam_app_ids.get(steam_app_id)
+        if steam_matches:
+            steam_match = unique_process_match(steam_matches)
+            if steam_match is not None:
+                return steam_app_id_process(steam_match, steam_app_id=steam_app_id)
+
+            executable_match = detect_executable_process(
+                os_detectables,
+                os_name=os_name,
+                argv=argv,
+                exe_path=exe_path,
+                application_ids={match.application_id for match in steam_matches},
+            )
+            if executable_match is not None:
+                steam_match = first_process_with_application_id(
+                    steam_matches,
+                    application_id=executable_match.application_id,
+                )
+                if steam_match is not None:
+                    return steam_app_id_process(
+                        steam_match,
+                        steam_app_id=steam_app_id,
+                        executable_match=executable_match,
+                    )
+
+            return None
+
+    return detect_executable_process(
+        os_detectables,
+        os_name=os_name,
+        argv=argv,
+        exe_path=exe_path,
+    )
+
+
 def detectable_process_to_json(process: Optional[DetectableProcess]) -> Optional[dict[str, object]]:
     if process is None:
         return None
 
-    return {
+    result: dict[str, object] = {
         "id": process.application_id,
         "name": process.application_name,
-        "os": process.os,
-        "executable": process.executable_name,
+        "match_type": process.match_type,
     }
+    if process.os is not None:
+        result["os"] = process.os
+    if process.executable_name is not None:
+        result["executable"] = process.executable_name
+    if process.steam_app_id is not None:
+        result["steam_app_id"] = process.steam_app_id
+
+    return result
 
 
 def process_display_name(process: DetectableProcess) -> str:
-    return process.application_name or process.executable_name
+    if process.application_name is not None:
+        return process.application_name
+
+    if process.executable_name is not None:
+        return process.executable_name
+
+    if process.steam_app_id is not None:
+        return f"Steam {process.steam_app_id}"
+
+    return process.application_id
 
 
 def format_detected_process(process: Optional[DetectableProcess]) -> str:
     if process is None:
         return "-"
 
-    if process.application_name is None:
-        return f"{process.application_id}/{process.executable_name}"
+    parts = [process.application_id]
+    if process.application_name is not None:
+        parts.append(process.application_name)
 
-    return f"{process.application_id}/{process.application_name}/{process.executable_name}"
+    if process.match_type == "steam_app_id":
+        parts.append(f"steam:{process.steam_app_id}")
+        if process.executable_name is not None:
+            parts.append(process.executable_name)
+    elif process.executable_name is not None:
+        parts.append(process.executable_name)
+
+    return "/".join(parts)
